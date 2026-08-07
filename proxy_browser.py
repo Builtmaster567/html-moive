@@ -1,499 +1,310 @@
-#!/usr/bin/env python3
 """
-Proxy Browser Server
-A fully functional web proxy that allows browsing websites through a proxy interface.
+Advanced Proxy Browser - "FoxProxy" Edition
+A fully functional, feature-rich proxy browser running in Codespaces.
+Includes: Tabs, History, Bookmarks, Settings, Themes, Ad-Blocker, UA Switching, and more.
 """
 
-from flask import Flask, request, Response, render_template_string, jsonify, redirect
+from flask import Flask, request, Response, redirect, url_for, send_from_directory, jsonify, render_template_string
 import requests
-from urllib.parse import urlparse, urljoin, quote
+from bs4 import BeautifulSoup
+from urllib.parse import urlparse, urljoin, quote, unquote
 import re
-import base64
-import ssl
+import json
+import os
+import time
+from datetime import datetime
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max limit
 
-# Disable SSL warnings for self-signed certificates
-requests.packages.urllib3.disable_warnings()
+# --- Configuration & State ---
+PROXY_PREFIX = '/proxy/'
+ALLOWED_METHODS = ['GET', 'POST', 'HEAD', 'OPTIONS']
+TIMEOUT = 30
+SESSION_DATA = {
+    'history': [],
+    'bookmarks': [
+        {'title': 'Google', 'url': 'https://www.google.com'},
+        {'title': 'Wikipedia', 'url': 'https://en.wikipedia.org'},
+        {'title': 'GitHub', 'url': 'https://github.com'}
+    ],
+    'settings': {
+        'block_ads': True,
+        'block_trackers': True,
+        'javascript_enabled': False,
+        'images_enabled': True,
+        'theme': 'dark',
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0'
+    }
+}
 
-# Configuration
-MAX_CONTENT_SIZE = 10 * 1024 * 1024  # 10MB max content size
-TIMEOUT = 30  # Request timeout in seconds
+def make_proxy_url(original_url):
+    if not original_url.startswith(('http://', 'https://')):
+        original_url = 'https://' + original_url
+    return f"{PROXY_PREFIX}{quote(original_url, safe='')}"
 
-# HTML template for the proxy browser interface
-BROWSER_INTERFACE = '''
+def rewrite_html(html_content, base_url):
+    soup = BeautifulSoup(html_content, 'html.parser')
+    
+    for tag in soup.find_all('a', href=True):
+        href = tag['href']
+        if href.startswith('#') or href.startswith('javascript:') or href.startswith('data:'):
+            continue
+        absolute_url = urljoin(base_url, href)
+        tag['href'] = make_proxy_url(absolute_url)
+        if tag.has_attr('target'):
+            tag['target'] = '_self'
+
+    if SESSION_DATA['settings']['images_enabled']:
+        for tag in soup.find_all(['img', 'source', 'video', 'audio'], src=True):
+            src = tag['src']
+            if src.startswith('data:'):
+                continue
+            absolute_url = urljoin(base_url, src)
+            tag['src'] = make_proxy_url(absolute_url)
+    
+    for tag in soup.find_all(style=True):
+        style = tag['style']
+        urls = re.findall(r'url\([\'"]?(.*?)[\'"]?\)', style)
+        for url in urls:
+            if not url.startswith('data:'):
+                abs_url = urljoin(base_url, url)
+                new_url = make_proxy_url(abs_url)
+                style = style.replace(url, new_url)
+        tag['style'] = style
+
+    for form in soup.find_all('form', action=True):
+        action = form['action']
+        absolute_url = urljoin(base_url, action)
+        form['action'] = make_proxy_url(absolute_url)
+        form['method'] = form.get('method', 'GET').upper()
+        if form['method'] not in ['GET', 'POST']:
+            form['method'] = 'POST'
+
+    if soup.head:
+        base_tag = soup.new_tag('base', href=make_proxy_url(base_url))
+        soup.head.insert(0, base_tag)
+        
+    for meta in soup.find_all('meta', http_equiv=True):
+        if meta['http-equiv'].lower() == 'content-security-policy':
+            meta.decompose()
+
+    return str(soup)
+
+def rewrite_css(css_content, base_url):
+    urls = re.findall(r'url\([\'"]?(.*?)[\'"]?\)', css_content)
+    for url in urls:
+        if not url.startswith('data:') and not url.startswith('#'):
+            abs_url = urljoin(base_url, url)
+            new_url = make_proxy_url(abs_url)
+            css_content = css_content.replace(url, new_url)
+    return css_content
+
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
+
+@app.route('/api/history', methods=['GET', 'POST'])
+def api_history():
+    if request.method == 'POST':
+        data = request.json
+        if data.get('action') == 'add':
+            entry = {'url': data['url'], 'title': data.get('title', data['url']), 'time': datetime.now().isoformat()}
+            SESSION_DATA['history'].insert(0, entry)
+            if len(SESSION_DATA['history']) > 100:
+                SESSION_DATA['history'] = SESSION_DATA['history'][:100]
+            return jsonify({'success': True})
+        elif data.get('action') == 'clear':
+            SESSION_DATA['history'] = []
+            return jsonify({'success': True})
+    return jsonify(SESSION_DATA['history'])
+
+@app.route('/api/bookmarks', methods=['GET', 'POST', 'DELETE'])
+def api_bookmarks():
+    if request.method == 'POST':
+        data = request.json
+        SESSION_DATA['bookmarks'].append({'title': data['title'], 'url': data['url']})
+        return jsonify({'success': True, 'bookmarks': SESSION_DATA['bookmarks']})
+    elif request.method == 'DELETE':
+        data = request.json
+        SESSION_DATA['bookmarks'] = [b for b in SESSION_DATA['bookmarks'] if b['url'] != data.get('url')]
+        return jsonify({'success': True, 'bookmarks': SESSION_DATA['bookmarks']})
+    return jsonify(SESSION_DATA['bookmarks'])
+
+@app.route('/api/settings', methods=['GET', 'POST'])
+def api_settings():
+    if request.method == 'POST':
+        SESSION_DATA['settings'].update(request.json)
+        return jsonify({'success': True, 'settings': SESSION_DATA['settings']})
+    return jsonify(SESSION_DATA['settings'])
+
+@app.route('/')
+@app.route('/<path:path>')
+def serve_interface(path=None):
+    html_ui = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Proxy Browser</title>
+    <title>FoxProxy Browser</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-            background: #1a1a2e;
-            height: 100vh;
-            display: flex;
-            flex-direction: column;
-        }
-        
-        .browser-bar {
-            background: #16213e;
-            padding: 15px 20px;
-            display: flex;
-            align-items: center;
-            gap: 15px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.3);
-        }
-        
-        .nav-buttons {
-            display: flex;
-            gap: 8px;
-        }
-        
-        .nav-btn {
-            width: 40px;
-            height: 40px;
-            border-radius: 50%;
-            border: none;
-            background: #0f3460;
-            color: #e94560;
-            font-size: 18px;
-            cursor: pointer;
-            transition: all 0.3s ease;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-        
-        .nav-btn:hover {
-            background: #e94560;
-            color: white;
-            transform: scale(1.1);
-        }
-        
-        .nav-btn:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-            transform: none;
-        }
-        
-        .url-bar {
-            flex: 1;
-            display: flex;
-            align-items: center;
-            background: #0f3460;
-            border-radius: 25px;
-            padding: 5px 15px;
-            gap: 10px;
-        }
-        
-        .url-bar input {
-            flex: 1;
-            background: transparent;
-            border: none;
-            color: #fff;
-            font-size: 16px;
-            padding: 10px;
-            outline: none;
-        }
-        
-        .url-bar input::placeholder {
-            color: #888;
-        }
-        
-        .go-btn {
-            background: #e94560;
-            color: white;
-            border: none;
-            padding: 10px 25px;
-            border-radius: 20px;
-            cursor: pointer;
-            font-weight: bold;
-            transition: all 0.3s ease;
-        }
-        
-        .go-btn:hover {
-            background: #ff6b6b;
-            transform: scale(1.05);
-        }
-        
-        .content-frame {
-            flex: 1;
-            background: #fff;
-            border: none;
-            width: 100%;
-        }
-        
-        .loading {
-            display: none;
-            position: fixed;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            background: rgba(0,0,0,0.8);
-            color: white;
-            padding: 30px 50px;
-            border-radius: 10px;
-            z-index: 1000;
-        }
-        
-        .loading.active {
-            display: block;
-        }
-        
-        .error-message {
-            display: none;
-            position: fixed;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            background: #e94560;
-            color: white;
-            padding: 30px 50px;
-            border-radius: 10px;
-            z-index: 1000;
-            max-width: 500px;
-            text-align: center;
-        }
-        
-        .error-message.active {
-            display: block;
-        }
-        
-        .info-text {
-            color: #888;
-            font-size: 12px;
-            margin-top: 5px;
-        }
+        :root { --bg-color: #1c1b22; --toolbar-bg: #2b2a33; --text-color: #fbfbfe; --accent-color: #00ddff; --input-bg: #42414d; --tab-active: #42414d; --tab-inactive: #2b2a33; --border-color: #5b5b66; }
+        [data-theme="light"] { --bg-color: #ffffff; --toolbar-bg: #f0f0f4; --text-color: #15141a; --accent-color: #0060df; --input-bg: #ffffff; --tab-active: #ffffff; --tab-inactive: #f0f0f4; --border-color: #cfcfd8; }
+        body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: var(--bg-color); color: var(--text-color); display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+        .tabs-bar { display: flex; background: var(--toolbar-bg); padding: 8px 8px 0; gap: 4px; align-items: flex-end; border-bottom: 1px solid var(--border-color); }
+        .tab { padding: 8px 16px; border-radius: 8px 8px 0 0; cursor: pointer; font-size: 12px; max-width: 200px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: flex; align-items: center; gap: 8px; background: var(--tab-inactive); color: var(--text-color); opacity: 0.7; transition: 0.2s; }
+        .tab.active { background: var(--tab-active); opacity: 1; font-weight: bold; }
+        .tab:hover:not(.active) { background: rgba(255,255,255,0.1); }
+        .tab-close { width: 16px; height: 16px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 10px; }
+        .tab-close:hover { background: rgba(255,0,0,0.3); }
+        .new-tab-btn { width: 30px; height: 30px; border-radius: 50%; display: flex; align-items: center; justify-content: center; cursor: pointer; font-size: 18px; margin-bottom: 4px; }
+        .nav-bar { display: flex; align-items: center; padding: 8px; background: var(--toolbar-bg); gap: 8px; border-bottom: 1px solid var(--border-color); }
+        .nav-btn { background: none; border: none; color: var(--text-color); cursor: pointer; padding: 6px; border-radius: 4px; font-size: 16px; }
+        .nav-btn:hover { background: rgba(255,255,255,0.1); }
+        .url-bar-container { flex: 1; position: relative; display: flex; align-items: center; }
+        .url-bar { width: 100%; background: var(--input-bg); border: 1px solid transparent; border-radius: 4px; padding: 8px 12px; color: var(--text-color); font-size: 14px; outline: none; }
+        .url-bar:focus { border-color: var(--accent-color); box-shadow: 0 0 0 2px rgba(0, 221, 255, 0.3); }
+        .tools-bar { display: flex; justify-content: space-between; padding: 4px 8px; background: var(--toolbar-bg); font-size: 12px; border-bottom: 1px solid var(--border-color); }
+        .tool-group { display: flex; gap: 12px; }
+        .tool-item { cursor: pointer; display: flex; align-items: center; gap: 4px; opacity: 0.8; }
+        .tool-item:hover { opacity: 1; color: var(--accent-color); }
+        .browser-content { flex: 1; position: relative; background: #fff; }
+        iframe { width: 100%; height: 100%; border: none; display: block; }
+        .panel { position: absolute; top: 0; right: 0; width: 300px; height: 100%; background: var(--toolbar-bg); border-left: 1px solid var(--border-color); transform: translateX(100%); transition: transform 0.3s ease; z-index: 100; display: flex; flex-direction: column; }
+        .panel.open { transform: translateX(0); }
+        .panel-header { padding: 16px; font-weight: bold; border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; }
+        .panel-content { flex: 1; overflow-y: auto; padding: 8px; }
+        .panel-item { padding: 8px; border-radius: 4px; cursor: pointer; display: flex; flex-direction: column; gap: 4px; margin-bottom: 4px; }
+        .panel-item:hover { background: rgba(255,255,255,0.05); }
+        .close-panel { cursor: pointer; font-size: 18px; }
+        .start-page { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; background: var(--bg-color); color: var(--text-color); }
+        .logo { font-size: 48px; font-weight: bold; margin-bottom: 20px; color: var(--accent-color); }
+        .start-search { width: 500px; max-width: 90%; padding: 12px; border-radius: 24px; border: 1px solid var(--border-color); background: var(--input-bg); color: var(--text-color); font-size: 16px; outline: none; text-align: center; }
+        .quick-links { display: flex; gap: 20px; margin-top: 40px; flex-wrap: wrap; justify-content: center; }
+        .quick-link { display: flex; flex-direction: column; align-items: center; gap: 8px; cursor: pointer; width: 80px; }
+        .quick-icon { width: 48px; height: 48px; border-radius: 12px; background: var(--toolbar-bg); display: flex; align-items: center; justify-content: center; font-size: 20px; }
+        .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--accent-color); color: #000; padding: 8px 16px; border-radius: 20px; font-size: 14px; font-weight: bold; opacity: 0; transition: opacity 0.3s; pointer-events: none; z-index: 1000; }
+        .toast.show { opacity: 1; }
     </style>
 </head>
-<body>
-    <div class="browser-bar">
-        <div class="nav-buttons">
-            <button class="nav-btn" onclick="goBack()" title="Back">←</button>
-            <button class="nav-btn" onclick="goForward()" title="Forward">→</button>
-            <button class="nav-btn" onclick="reloadPage()" title="Reload">↻</button>
+<body data-theme="dark">
+    <div class="tabs-bar" id="tabsBar"></div>
+    <div class="nav-bar">
+        <button class="nav-btn" onclick="goBack()">←</button>
+        <button class="nav-btn" onclick="goForward()">→</button>
+        <button class="nav-btn" onclick="reloadPage()">↻</button>
+        <button class="nav-btn" onclick="goHome()">🏠</button>
+        <div class="url-bar-container">
+            <input type="text" class="url-bar" id="urlInput" placeholder="Search or enter address" onkeydown="if(event.key==='Enter') navigateTo()">
         </div>
-        <div class="url-bar">
-            <input type="text" id="urlInput" placeholder="Enter URL (e.g., https://example.com)" 
-                   onkeypress="if(event.key==='Enter')navigate()">
-            <button class="go-btn" onclick="navigate()">GO</button>
+        <button class="nav-btn" onclick="togglePanel('bookmarksPanel')">★</button>
+        <button class="nav-btn" onclick="togglePanel('historyPanel')">🕒</button>
+        <button class="nav-btn" onclick="togglePanel('settingsPanel')">⚙️</button>
+    </div>
+    <div class="tools-bar">
+        <div class="tool-group">
+            <div class="tool-item" onclick="toggleAdBlock()">🚫 Ads: <span id="adBlockStatus">ON</span></div>
+            <div class="tool-item" onclick="changeTheme()">🎨 Theme</div>
         </div>
     </div>
-    
-    <iframe id="contentFrame" class="content-frame" sandbox="allow-same-origin allow-scripts allow-forms"></iframe>
-    
-    <div class="loading" id="loading">Loading...</div>
-    <div class="error-message" id="errorMessage"></div>
-    
+    <div class="browser-content" id="contentArea">
+        <iframe id="mainFrame" name="mainFrame" sandbox="allow-forms allow-same-origin allow-scripts allow-popups"></iframe>
+        <div id="startPage" class="start-page" style="display:none;">
+            <div class="logo">🦊 FoxProxy</div>
+            <input type="text" class="start-search" placeholder="Search the web..." onkeydown="if(event.key==='Enter') startSearch(this.value)">
+            <div class="quick-links" id="quickLinks"></div>
+        </div>
+    </div>
+    <div class="panel" id="bookmarksPanel"><div class="panel-header">Bookmarks <span class="close-panel" onclick="togglePanel('bookmarksPanel')">&times;</span></div><div class="panel-content" id="bookmarksList"></div></div>
+    <div class="panel" id="historyPanel"><div class="panel-header">History <span class="close-panel" onclick="togglePanel('historyPanel')">&times;</span></div><div class="panel-content" id="historyList"></div></div>
+    <div class="panel" id="settingsPanel"><div class="panel-header">Settings <span class="close-panel" onclick="togglePanel('settingsPanel')">&times;</span></div><div class="panel-content"><div class="panel-item">Firefox UA Active</div></div></div>
+    <div class="toast" id="toast">Notification</div>
     <script>
-        let history = [];
-        let historyIndex = -1;
-        
-        function navigate(url) {
-            const input = document.getElementById('urlInput');
-            url = url || input.value.trim();
-            
-            if (!url) {
-                showError('Please enter a URL');
-                return;
-            }
-            
-            // Add http:// if no protocol specified
-            if (!url.startsWith('http://') && !url.startsWith('https://')) {
-                url = 'https://' + url;
-            }
-            
-            // Validate URL
-            try {
-                new URL(url);
-            } catch (e) {
-                showError('Invalid URL format');
-                return;
-            }
-            
-            // Navigate through proxy
-            const proxyUrl = '/proxy/' + encodeURIComponent(url);
-            
-            showLoading();
-            
-            fetch(proxyUrl)
-                .then(response => {
-                    if (!response.ok) {
-                        throw new Error('Failed to load page: ' + response.status);
-                    }
-                    return response.text();
-                })
-                .then(html => {
-                    const frame = document.getElementById('contentFrame');
-                    frame.srcdoc = html;
-                    
-                    // Update history
-                    if (historyIndex < history.length - 1) {
-                        history = history.slice(0, historyIndex + 1);
-                    }
-                    history.push(url);
-                    historyIndex = history.length - 1;
-                    
-                    input.value = url;
-                    hideLoading();
-                })
-                .catch(error => {
-                    hideLoading();
-                    showError(error.message);
-                });
-        }
-        
-        function goBack() {
-            if (historyIndex > 0) {
-                historyIndex--;
-                navigate(history[historyIndex]);
-            }
-        }
-        
-        function goForward() {
-            if (historyIndex < history.length - 1) {
-                historyIndex++;
-                navigate(history[historyIndex]);
-            }
-        }
-        
-        function reloadPage() {
-            if (historyIndex >= 0) {
-                navigate(history[historyIndex]);
-            }
-        }
-        
-        function showLoading() {
-            document.getElementById('loading').classList.add('active');
-            document.getElementById('errorMessage').classList.remove('active');
-        }
-        
-        function hideLoading() {
-            document.getElementById('loading').classList.remove('active');
-        }
-        
-        function showError(message) {
-            const errorDiv = document.getElementById('errorMessage');
-            errorDiv.textContent = message;
-            errorDiv.classList.add('active');
-            setTimeout(() => {
-                errorDiv.classList.remove('active');
-            }, 5000);
-        }
-        
-        // Allow direct URL parameter
-        const urlParams = new URLSearchParams(window.location.search);
-        const initialUrl = urlParams.get('url');
-        if (initialUrl) {
-            navigate(initialUrl);
-        }
+        let tabs = [{ id: 1, url: '', title: 'New Tab', history: [], historyIndex: -1 }];
+        let activeTabId = 1;
+        let settings = { ads: true, theme: 'dark' };
+        function init() { loadSettings(); renderTabs(); showStartPage(); loadBookmarks(); loadHistory(); }
+        function loadSettings() { fetch('/api/settings').then(r=>r.json()).then(data => { settings = data; document.body.setAttribute('data-theme', data.theme); document.getElementById('adBlockStatus').innerText = data.block_ads ? 'ON' : 'OFF'; }); }
+        function renderTabs() { const bar = document.getElementById('tabsBar'); bar.innerHTML = ''; tabs.forEach(tab => { const el = document.createElement('div'); el.className = 'tab ' + (tab.id === activeTabId ? 'active' : ''); el.onclick = () => switchTab(tab.id); el.innerHTML = '<span>' + tab.title.substring(0, 15) + '</span><span class="tab-close" onclick="event.stopPropagation(); closeTab('+tab.id+')">&times;</span>'; bar.appendChild(el); }); const newBtn = document.createElement('div'); newBtn.className = 'new-tab-btn'; newBtn.innerHTML = '+'; newBtn.onclick = createTab; bar.appendChild(newBtn); }
+        function createTab(url = '') { const newId = Date.now(); tabs.push({ id: newId, url: url, title: 'New Tab', history: [], historyIndex: -1 }); switchTab(newId); if(url) navigateTo(url); else showStartPage(); }
+        function closeTab(id) { if(tabs.length === 1) { tabs[0].url = ''; tabs[0].title = 'New Tab'; tabs[0].history = []; tabs[0].historyIndex = -1; showStartPage(); renderTabs(); return; } const idx = tabs.findIndex(t => t.id === id); tabs.splice(idx, 1); if(activeTabId === id) switchTab(tabs[Math.max(0, idx-1)].id); else renderTabs(); }
+        function switchTab(id) { activeTabId = id; const tab = tabs.find(t => t.id === id); renderTabs(); updateUI(tab); }
+        function updateUI(tab) { document.getElementById('urlInput').value = tab.url; if(tab.url) { document.getElementById('startPage').style.display = 'none'; document.getElementById('mainFrame').style.display = 'block'; } else showStartPage(); }
+        function showStartPage() { document.getElementById('mainFrame').style.display = 'none'; document.getElementById('startPage').style.display = 'flex'; renderQuickLinks(); }
+        function renderQuickLinks() { const container = document.getElementById('quickLinks'); container.innerHTML = ''; fetch('/api/bookmarks').then(r=>r.json()).then(bms => { bms.slice(0, 6).forEach(bm => { const div = document.createElement('div'); div.className = 'quick-link'; div.innerHTML = '<div class="quick-icon">🌐</div><span>'+bm.title+'</span>'; div.onclick = () => navigateTo(bm.url); container.appendChild(div); }); }); }
+        function navigateTo(forcedUrl) { const input = document.getElementById('urlInput'); let url = forcedUrl || input.value; if(!url) return; if(!url.startsWith('http')) { if(url.includes('.') && !url.includes(' ')) url = 'https://' + url; else url = 'https://www.google.com/search?q=' + encodeURIComponent(url); } const tab = tabs.find(t => t.id === activeTabId); tab.url = url; tab.title = url; tab.historyIndex++; tab.history = tab.history.slice(0, tab.historyIndex); tab.history.push(url); fetch('/api/history', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({action: 'add', url: url, title: url}) }); document.getElementById('mainFrame').src = '/proxy/' + encodeURIComponent(url); document.getElementById('mainFrame').style.display = 'block'; document.getElementById('startPage').style.display = 'none'; updateUI(tab); renderTabs(); showToast('Loading...'); }
+        function startSearch(query) { navigateTo('https://www.google.com/search?q=' + encodeURIComponent(query)); }
+        function goBack() { const tab = tabs.find(t => t.id === activeTabId); if(tab.historyIndex > 0) { tab.historyIndex--; const url = tab.history[tab.historyIndex]; tab.url = url; updateUI(tab); document.getElementById('mainFrame').src = '/proxy/' + encodeURIComponent(url); } }
+        function goForward() { const tab = tabs.find(t => t.id === activeTabId); if(tab.historyIndex < tab.history.length - 1) { tab.historyIndex++; const url = tab.history[tab.historyIndex]; tab.url = url; updateUI(tab); document.getElementById('mainFrame').src = '/proxy/' + encodeURIComponent(url); } }
+        function reloadPage() { const frame = document.getElementById('mainFrame'); frame.src = frame.src; showToast('Reloading...'); }
+        function goHome() { const tab = tabs.find(t => t.id === activeTabId); tab.url = ''; tab.history = []; tab.historyIndex = -1; showStartPage(); updateUI(tab); renderTabs(); }
+        function togglePanel(id) { const p = document.getElementById(id); if(p.classList.contains('open')) p.classList.remove('open'); else { document.querySelectorAll('.panel').forEach(x => x.classList.remove('open')); p.classList.add('open'); if(id === 'bookmarksPanel') loadBookmarks(); if(id === 'historyPanel') loadHistory(); } }
+        function loadBookmarks() { fetch('/api/bookmarks').then(r=>r.json()).then(bms => { const list = document.getElementById('bookmarksList'); list.innerHTML = ''; bms.forEach(bm => { const div = document.createElement('div'); div.className = 'panel-item'; div.innerHTML = '<div style="font-weight:500">'+bm.title+'</div><div style="font-size:11px;opacity:0.7">'+bm.url+'</div>'; div.onclick = () => { navigateTo(bm.url); togglePanel('bookmarksPanel'); }; list.appendChild(div); }); }); }
+        function loadHistory() { fetch('/api/history').then(r=>r.json()).then(hist => { const list = document.getElementById('historyList'); list.innerHTML = ''; hist.forEach(h => { const div = document.createElement('div'); div.className = 'panel-item'; div.innerHTML = '<div style="font-weight:500">'+h.title+'</div><div style="font-size:11px;opacity:0.7">'+h.time.split('T')[0]+'</div>'; div.onclick = () => { navigateTo(h.url); togglePanel('historyPanel'); }; list.appendChild(div); }); }); }
+        function toggleAdBlock() { const newVal = !settings.ads; settings.ads = newVal; fetch('/api/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({block_ads: newVal})}); document.getElementById('adBlockStatus').innerText = newVal ? 'ON' : 'OFF'; showToast(newVal ? 'Ad Blocker Enabled' : 'Ad Blocker Disabled'); }
+        function changeTheme() { const newTheme = settings.theme === 'dark' ? 'light' : 'dark'; settings.theme = newTheme; document.body.setAttribute('data-theme', newTheme); fetch('/api/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({theme: newTheme})}); }
+        function showToast(msg) { const t = document.getElementById('toast'); t.innerText = msg; t.classList.add('show'); setTimeout(() => t.classList.remove('show'), 2000); }
+        init();
     </script>
 </body>
 </html>
-'''
+    """
+    return render_template_string(html_ui)
 
-def get_base_url(url):
-    """Extract base URL from full URL"""
-    parsed = urlparse(url)
-    return f"{parsed.scheme}://{parsed.netloc}"
-
-def rewrite_urls(content, base_url, proxy_prefix='/proxy/'):
-    """Rewrite URLs in HTML content to go through proxy"""
-    
-    # Rewrite href attributes
-    def rewrite_href(match):
-        attr = match.group(1)
-        url = match.group(2)
-        if url.startswith(('javascript:', 'data:', '#', 'mailto:', 'tel:')):
-            return match.group(0)
-        if not url.startswith('http'):
-            url = urljoin(base_url, url)
-        return f'{attr}="{proxy_prefix}{quote(url)}"'
-    
-    content = re.sub(r'(href\s*=\s*["\'])([^"\']+?)["\']', rewrite_href, content, flags=re.IGNORECASE)
-    
-    # Rewrite src attributes
-    def rewrite_src(match):
-        attr = match.group(1)
-        url = match.group(2)
-        if url.startswith(('data:', '#')):
-            return match.group(0)
-        if not url.startswith('http'):
-            url = urljoin(base_url, url)
-        return f'{attr}="{proxy_prefix}{quote(url)}"'
-    
-    content = re.sub(r'(src\s*=\s*["\'])([^"\']+?)["\']', rewrite_src, content, flags=re.IGNORECASE)
-    
-    # Rewrite action attributes in forms
-    def rewrite_action(match):
-        attr = match.group(1)
-        url = match.group(2)
-        if not url.startswith('http'):
-            url = urljoin(base_url, url)
-        return f'{attr}="{proxy_prefix}{quote(url)}"'
-    
-    content = re.sub(r'(action\s*=\s*["\'])([^"\']*?)["\']', rewrite_action, content, flags=re.IGNORECASE)
-    
-    # Rewrite CSS url() references
-    def rewrite_css_url(match):
-        url = match.group(1).strip('"\'')
-        if url.startswith(('data:', '#')):
-            return match.group(0)
-        if not url.startswith('http'):
-            url = urljoin(base_url, url)
-        return f'url("{proxy_prefix}{quote(url)}")'
-    
-    content = re.sub(r'url\(\s*["\']?([^)]+?)["\']?\s*\)', rewrite_css_url, content)
-    
-    # Add base tag to help with relative URLs
-    if '<head>' in content.lower():
-        content = re.sub(r'(<head[^>]*>)', f'\\1<base href="{base_url}">', content, flags=re.IGNORECASE)
-    
-    return content
-
-@app.route('/')
-def index():
-    """Serve the proxy browser interface"""
-    return render_template_string(BROWSER_INTERFACE)
-
-# Catch-all route must be defined LAST to avoid capturing /proxy routes
-@app.route('/<path:catch_all>')
-def catch_all(catch_all=None):
-    """Catch all other routes and serve the main interface"""
-    return render_template_string(BROWSER_INTERFACE)
-
-@app.route('/proxy/<path:url>')
-def proxy(url):
-    """Proxy endpoint that fetches and rewrites web content"""
-    
-    # Decode the URL
-    try:
-        target_url = requests.utils.unquote(url)
-        
-        # Handle double encoding
-        if target_url.startswith('http'):
-            pass
-        else:
-            # Try to decode again if it looks encoded
-            try:
-                target_url = requests.utils.unquote(target_url)
-            except:
-                pass
-    except Exception as e:
-        return jsonify({'error': f'Invalid URL: {str(e)}'}), 400
-    
-    # Validate URL
+@app.route(PROXY_PREFIX + '<path:url>')
+def proxy_get(url):
+    target_url = unquote(url)
     if not target_url.startswith(('http://', 'https://')):
         target_url = 'https://' + target_url
     
     try:
-        parsed = urlparse(target_url)
-        if not parsed.netloc:
-            return jsonify({'error': 'Invalid URL format'}), 400
-    except Exception as e:
-        return jsonify({'error': f'URL parsing error: {str(e)}'}), 400
-    
-    # Fetch the content
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Accept-Encoding': 'gzip, deflate',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-    }
-    
-    try:
-        response = requests.get(
-            target_url,
-            headers=headers,
-            timeout=TIMEOUT,
-            verify=False,  # Disable SSL verification for proxy functionality
-            allow_redirects=True,
-            stream=True
-        )
-        
-        # Check content size
-        content_length = response.headers.get('Content-Length')
-        if content_length and int(content_length) > MAX_CONTENT_SIZE:
-            return jsonify({'error': 'Content too large'}), 413
-        
-        # Get content
-        content = response.content
-        
-        # Determine content type
-        content_type = response.headers.get('Content-Type', 'text/html')
-        
-        # Process HTML content
-        if 'text/html' in content_type:
-            try:
-                html_content = content.decode('utf-8', errors='ignore')
-                base_url = get_base_url(target_url)
-                rewritten_content = rewrite_urls(html_content, base_url)
-                
-                return Response(
-                    rewritten_content,
-                    status=response.status_code,
-                    headers={
-                        'Content-Type': 'text/html; charset=utf-8',
-                        'X-Proxied-URL': target_url,
-                        'X-Frame-Options': 'SAMEORIGIN',
-                    }
-                )
-            except Exception as e:
-                return jsonify({'error': f'HTML processing error: {str(e)}'}), 500
-        
-        # Return other content types as-is (images, CSS, JS, etc.)
-        response_headers = {
-            'Content-Type': content_type,
-            'X-Proxied-URL': target_url,
+        headers = {
+            'User-Agent': SESSION_DATA['settings']['user_agent'],
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
         }
         
-        # Copy cache headers
-        for header in ['Cache-Control', 'ETag', 'Last-Modified']:
-            if header in response.headers:
-                response_headers[header] = response.headers[header]
-        
-        return Response(
-            content,
-            status=response.status_code,
-            headers=response_headers
-        )
-        
-    except requests.exceptions.Timeout:
-        return jsonify({'error': 'Request timed out'}), 504
-    except requests.exceptions.ConnectionError:
-        return jsonify({'error': 'Failed to connect to the website'}), 502
-    except requests.exceptions.RequestException as e:
-        return jsonify({'error': f'Request error: {str(e)}'}), 500
-    except Exception as e:
-        return jsonify({'error': f'Unexpected error: {str(e)}'}), 500
+        if SESSION_DATA['settings']['block_ads']:
+            blocked_domains = ['doubleclick.net', 'adservice.google.com', 'facebook.com/tr']
+            parsed = urlparse(target_url)
+            if any(blocked in parsed.netloc for blocked in blocked_domains):
+                return Response("Blocked by AdBlocker", status=403)
 
-@app.route('/health')
-def health():
-    """Health check endpoint"""
-    return jsonify({'status': 'healthy', 'service': 'proxy-browser'})
+        resp = requests.get(target_url, headers=headers, timeout=TIMEOUT, verify=False, allow_redirects=True)
+        content_type = resp.headers.get('Content-Type', '').lower()
+        content = resp.content
+        
+        if 'text/html' in content_type:
+            try:
+                decoded_content = content.decode('utf-8', errors='ignore')
+                rewritten = rewrite_html(decoded_content, target_url)
+                return Response(rewritten, status=resp.status_code, content_type='text/html; charset=utf-8')
+            except Exception as e:
+                return Response(f"Error rewriting HTML: {str(e)}", status=500)
+        
+        if 'text/css' in content_type:
+            try:
+                decoded_content = content.decode('utf-8', errors='ignore')
+                rewritten = rewrite_css(decoded_content, target_url)
+                return Response(rewritten, status=resp.status_code, content_type='text/css; charset=utf-8')
+            except Exception as e:
+                return content
+        
+        return Response(content, status=resp.status_code, content_type=resp.headers.get('Content-Type'))
+
+    except requests.exceptions.RequestException as e:
+        error_html = f"""
+        <html><body style="background:#222; color:#fff; font-family:sans-serif; padding:50px; text-align:center;">
+            <h1>🦊 FoxProxy Error</h1>
+            <p>Failed to load: {target_url}</p>
+            <p style="color:#ff6b6b">{str(e)}</p>
+            <button onclick="window.history.back()" style="padding:10px 20px; background:#00ddff; border:none; border-radius:5px; cursor:pointer; color:#000; font-weight:bold; margin-top:20px;">Go Back</button>
+        </body></html>
+        """
+        return Response(error_html, status=502, content_type='text/html')
 
 if __name__ == '__main__':
-    print("=" * 60)
-    print("🌐 Proxy Browser Server Starting...")
-    print("=" * 60)
-    print("\n📍 Access the proxy browser at:")
-    print("   http://localhost:5000/")
-    print("\n💡 Usage:")
-    print("   1. Open http://localhost:5000/ in your browser")
-    print("   2. Enter any URL (e.g., https://example.com)")
-    print("   3. Click GO to browse through the proxy")
-    print("\n⚠️  Note: This is for educational purposes only.")
-    print("   Respect website terms of service and robots.txt")
-    print("=" * 60)
-    
-    app.run(host='0.0.0.0', port=5000, debug=True, threaded=True)
+    print("🦊 FoxProxy Browser Starting...")
+    print("Access at: http://localhost:5000")
+    app.run(host='0.0.0.0', port=5000, debug=False)
