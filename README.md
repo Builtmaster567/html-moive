@@ -20,13 +20,21 @@ A fully functional web proxy browser built with Python Flask that allows you to 
 
 ## Installation
 
+### Option 1: Using requirements.txt (Recommended)
+
+```bash
+pip install -r requirements.txt
+```
+
+### Option 2: Manual Installation
+
 ```bash
 pip install flask requests
 ```
 
 ## Usage
 
-### Start the Server
+### Running Locally
 
 ```bash
 python proxy_browser.py
@@ -34,7 +42,18 @@ python proxy_browser.py
 
 The server will start on `http://localhost:5000/`
 
-### Access the Proxy Browser
+### Running in GitHub Codespaces
+
+1. **Create a Codespace**: Click the "Code" button on your repository and select "Create codespace on main"
+2. **Wait for Setup**: Codespaces will automatically install dependencies from `requirements.txt`
+3. **Start the Server**: Run `python proxy_browser.py` in the terminal
+4. **Make Port Public**: 
+   - Go to the "Ports" tab at the bottom
+   - Right-click on port 5000
+   - Select "Port Visibility" → "Public"
+5. **Access Your Browser**: Click the "Forwarded Address" link that appears
+
+### Direct URL Access
 
 1. Open your web browser
 2. Navigate to `http://localhost:5000/`

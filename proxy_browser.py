@@ -364,6 +364,12 @@ def index():
     """Serve the proxy browser interface"""
     return render_template_string(BROWSER_INTERFACE)
 
+# Catch-all route must be defined LAST to avoid capturing /proxy routes
+@app.route('/<path:catch_all>')
+def catch_all(catch_all=None):
+    """Catch all other routes and serve the main interface"""
+    return render_template_string(BROWSER_INTERFACE)
+
 @app.route('/proxy/<path:url>')
 def proxy(url):
     """Proxy endpoint that fetches and rewrites web content"""
